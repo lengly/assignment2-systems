@@ -8,6 +8,7 @@ import timeit
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.cuda.nvtx as nvtx
 from typing import Dict, Any
 import sys
 import os
@@ -61,21 +62,24 @@ def benchmark_model(
     
     # Warm-up phase
     print(f"Running {num_warmup} warm-up steps...")
-    for _ in range(num_warmup):
-        if forward_only:
-            with torch.no_grad():
-                _ = model(batch)
-        else:
-            # Forward pass
-            logits = model(batch)
-            # Create dummy targets for loss calculation
-            targets = torch.randint(0, logits.size(-1), (batch.size(0), batch.size(1)), device=device)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-            # Backward pass
-            loss.backward()
-        
-        if device == 'cuda':
-            torch.cuda.synchronize()
+    with nvtx.range("warmup", color="green"):
+        for _ in range(num_warmup):
+            if forward_only:
+                with torch.no_grad():
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        _ = model(batch)
+            else:
+                # Forward pass
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    logits = model(batch)
+                # Create dummy targets for loss calculation
+                targets = torch.randint(0, logits.size(-1), (batch.size(0), batch.size(1)), device=device)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+                # Backward pass
+                loss.backward()
+            
+            if device == 'cuda':
+                torch.cuda.synchronize()
     
     # Benchmarking phase
     print(f"Running {num_steps} benchmark steps...")
@@ -83,42 +87,45 @@ def benchmark_model(
     backward_times = []
     total_times = []
     
-    for step in range(num_steps):
-        if forward_only:
-            # Forward pass only
-            start_time = timeit.default_timer()
-            with torch.no_grad():
-                _ = model(batch)
-            if device == 'cuda':
-                torch.cuda.synchronize()
-            end_time = timeit.default_timer()
-            forward_times.append(end_time - start_time)
-            total_times.append(end_time - start_time)
-        else:
-            # Forward pass timing
-            start_forward = timeit.default_timer()
-            logits = model(batch)
-            # Create dummy targets for loss calculation
-            targets = torch.randint(0, logits.size(-1), (batch.size(0), batch.size(1)), device=device)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-            if device == 'cuda':
-                torch.cuda.synchronize()
-            end_forward = timeit.default_timer()
-            forward_times.append(end_forward - start_forward)
+    with nvtx.range("benchmarking", color="blue"):
+        for step in range(num_steps):
+            if forward_only:
+                # Forward pass only
+                start_time = timeit.default_timer()
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    with torch.no_grad():
+                        _ = model(batch)
+                if device == 'cuda':
+                    torch.cuda.synchronize()
+                end_time = timeit.default_timer()
+                forward_times.append(end_time - start_time)
+                total_times.append(end_time - start_time)
+            else:
+                # Forward pass timing
+                start_forward = timeit.default_timer()
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    logits = model(batch)
+                # Create dummy targets for loss calculation
+                targets = torch.randint(0, logits.size(-1), (batch.size(0), batch.size(1)), device=device)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+                if device == 'cuda':
+                    torch.cuda.synchronize()
+                end_forward = timeit.default_timer()
+                forward_times.append(end_forward - start_forward)
+                
+                # Backward pass timing
+                start_backward = timeit.default_timer()
+                loss.backward()
+                if device == 'cuda':
+                    torch.cuda.synchronize()
+                end_backward = timeit.default_timer()
+                backward_times.append(end_backward - start_backward)
+                
+                # Total time
+                total_times.append(end_backward - start_forward)
             
-            # Backward pass timing
-            start_backward = timeit.default_timer()
-            loss.backward()
-            if device == 'cuda':
-                torch.cuda.synchronize()
-            end_backward = timeit.default_timer()
-            backward_times.append(end_backward - start_backward)
-            
-            # Total time
-            total_times.append(end_backward - start_forward)
-        
-        if (step + 1) % 10 == 0:
-            print(f"Completed {step + 1}/{num_steps} steps")
+            if (step + 1) % 10 == 0:
+                print(f"Completed {step + 1}/{num_steps} steps")
     
     # Calculate statistics
     forward_times = torch.tensor(forward_times)
@@ -234,7 +241,7 @@ def main():
         'd_ff': args.d_ff,
         'rope_theta': args.rope_theta
     }
-    
+    torch.cuda.memory._record_memory_history(max_entries=1000000)
     print("Initializing model...")
     model = create_model(config, args.device)
     
@@ -250,7 +257,8 @@ def main():
         forward_only=args.forward_only,
         device=args.device
     )
-    
+    torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+    torch.cuda.memory._record_memory_history(enabled=None)
     print_results(results, config, model, args.forward_only)
 
 
