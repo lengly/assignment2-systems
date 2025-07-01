@@ -25,16 +25,18 @@ import pandas as pd
 
 # Import the attention function from the existing codebase
 from attention_functions import (
-    scaled_dot_product_attention,
-    custom_attention_implementation,
-    pytorch_flash_attention,
+    ScaledDotProductAttention,
+    CustomAttentionImplementation,
+    PytorchFlashAttention,
+    CompiledScaledDotProductAttention,
 )
 
 
-benchmark_function_dict = {
-    # "scaled_dot_product_attention": scaled_dot_product_attention,
-    # "custom_attention": custom_attention_implementation,
-    "pytorch_flash_attention": pytorch_flash_attention,
+benchmark_class_dict = {
+    "CompiledScaledDotProductAttention": CompiledScaledDotProductAttention,
+    "ScaledDotProductAttention": ScaledDotProductAttention,
+    "CustomAttentionImplementation": CustomAttentionImplementation,
+    "PytorchFlashAttention": PytorchFlashAttention,
 }
 
 @dataclass
@@ -78,12 +80,12 @@ def create_attention_inputs(batch_size: int, seq_len: int, d_model: int, device:
 
 
 def benchmark_attention_function(
-    attention_func: Callable,
+    attention_cls: torch.nn.Module,
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
     config: BenchmarkConfig,
-    func_name: str
+    cls_name: str
 ) -> Dict:
     """
     Benchmark a specific attention function.
@@ -101,11 +103,12 @@ def benchmark_attention_function(
     casual_mask = torch.triu(torch.ones(Q.shape[1], K.shape[1], device=device), diagonal=1)
     
     # Warmup phase
-    print(f"  Warming up {func_name}...")
+    model = attention_cls()
+    print(f"  Warming up {cls_name}...")
     for _ in range(config.num_warmup):
-        with torch.no_grad():
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                _ = attention_func(Q, K, V, mask=casual_mask)
+        # with torch.no_grad():
+            # with torch.autocast("cuda", dtype=torch.bfloat16):
+        _ = model(Q, K, V, mask=casual_mask)
         if device.type == 'cuda':
             torch.cuda.synchronize()
     
@@ -121,8 +124,8 @@ def benchmark_attention_function(
     
     for _ in range(config.num_forward_passes):
         start_time = time.time()
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            output = attention_func(Q, K, V, mask=casual_mask)
+        # with torch.autocast("cuda", dtype=torch.bfloat16):
+        output = model(Q, K, V, mask=casual_mask)
         if device.type == 'cuda':
             torch.cuda.synchronize()
         end_time = time.time()
@@ -142,14 +145,14 @@ def benchmark_attention_function(
         V.grad = None
         
         # Forward pass
-        output = attention_func(Q, K, V)
+        output = model(Q, K, V)
         
         # Create dummy gradient for backward pass
         grad_output = torch.randn_like(output)
         
         # Backward pass timing
         start_time = time.time()
-        output.backward(grad_output, retain_graph=True)
+        output.backward(grad_output)
         if device.type == 'cuda':
             torch.cuda.synchronize()
         end_time = time.time()
@@ -160,7 +163,7 @@ def benchmark_attention_function(
     backward_times = torch.tensor(backward_times)
     
     results = {
-        'function_name': func_name,
+        'class_name': cls_name,
         'forward_mean_ms': forward_times.mean().item() * 1000,
         'forward_std_ms': forward_times.std().item() * 1000,
         'forward_min_ms': forward_times.min().item() * 1000,
@@ -255,9 +258,9 @@ def run_attention_benchmarks(config: BenchmarkConfig) -> List[Dict]:
             # Calculate theoretical memory usage
             theoretical_memory = calculate_memory_usage_theoretical(config.batch_size, seq_len, d_model)
             
-            for func_name, func in benchmark_function_dict.items():
+            for cls_name, cls_instance in benchmark_class_dict.items():
                 try:
-                    sdp_results = benchmark_attention_function(func, Q, K, V, config, func_name)
+                    sdp_results = benchmark_attention_function(cls_instance, Q, K, V, config, cls_name)
                     sdp_results.update({
                         'd_model': d_model,
                         'seq_len': seq_len,
@@ -268,9 +271,9 @@ def run_attention_benchmarks(config: BenchmarkConfig) -> List[Dict]:
                     sdp_results.update(theoretical_memory)
                     results.append(sdp_results)
                 except Exception as e:
-                    print(f"  Error with {func_name}: {e}")
+                    print(f"  Error with {cls_name}: {e}")
                     results.append({
-                        'function_name': func_name,
+                        'class_name': cls_name,
                         'd_model': d_model,
                         'seq_len': seq_len,
                         'batch_size': config.batch_size,
@@ -288,9 +291,9 @@ def run_attention_benchmarks(config: BenchmarkConfig) -> List[Dict]:
         except Exception as e:
             print(f"  Error creating inputs for d_model={d_model}, seq_len={seq_len}: {e}")
             # Add error entries for both functions
-            for func_name in ["scaled_dot_product_attention", "custom_attention"]:
+            for cls_name in ["ScaledDotProductAttention", "CustomAttentionImplementation"]:
                 results.append({
-                    'function_name': func_name,
+                    'class_name': cls_name,
                     'd_model': d_model,
                     'seq_len': seq_len,
                     'batch_size': config.batch_size,
@@ -321,7 +324,7 @@ def print_results_table(results: List[Dict]):
         print("-" * 120)
         
         for result in successful_results:
-            print(f"{result['function_name']:<25} {result['d_model']:<8} {result['seq_len']:<8} "
+            print(f"{result['class_name']:<25} {result['d_model']:<8} {result['seq_len']:<8} "
                   f"{result['forward_mean_ms']:<12.3f} {result['backward_mean_ms']:<13.3f} "
                   f"{result['memory_before_backward_mb']:<12.1f} {result['total_memory_mb']:<15.1f}")
     
@@ -333,7 +336,7 @@ def print_results_table(results: List[Dict]):
         
         for result in error_results:
             error_msg = result['error'][:47] + "..." if len(result['error']) > 50 else result['error']
-            print(f"{result['function_name']:<25} {result['d_model']:<8} {result['seq_len']:<8} {error_msg:<50}")
+            print(f"{result['class_name']:<25} {result['d_model']:<8} {result['seq_len']:<8} {error_msg:<50}")
 
 
 def save_results_to_csv(results: List[Dict], filename: str = "attention_benchmark_results.csv"):

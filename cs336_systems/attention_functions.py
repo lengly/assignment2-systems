@@ -1,7 +1,6 @@
 import torch
 from torch import Tensor
 import math
-from jaxtyping import Float, Bool, Int
 from einops import einsum
 import torch.nn.functional as F
 
@@ -11,44 +10,79 @@ def softmax(x, dim=-1):
     return exponentiated_rescaled_input / torch.sum(exponentiated_rescaled_input, dim=dim, keepdim=True)
 
 
-def scaled_dot_product_attention(
-    Q: Float[Tensor, " ... queries d_k"],
-    K: Float[Tensor, " ... keys    d_k"],
-    V: Float[Tensor, " ... keys    d_v"],
-    mask: Bool[Tensor, " ... queries keys"] | None = None,
-) -> Float[Tensor, " ... queries d_v"]:
-
-    d_k = K.shape[-1]
-    attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
-
-    if mask is not None:
-        attention_scores = attention_scores.masked_fill(mask == 1, float("-inf"))
-
-    attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
+class ScaledDotProductAttention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
     
-    return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+    def forward(
+        self,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        d_k = K.shape[-1]
+        attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
 
+        if mask is not None:
+            attention_scores = attention_scores.masked_fill(mask == 1, float("-inf"))
 
-def custom_attention_implementation(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-    """
-    Custom attention implementation for comparison.
-    This is a basic implementation that can be extended with more sophisticated attention mechanisms.
-    """
-    d_k = K.shape[-1]
-    
-    # Compute attention scores
-    scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_k)
-    if mask is not None:
-        scores = torch.where(mask == 1, scores, float("-inf"))
+        attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
         
-    # Apply softmax
-    attention_weights = F.softmax(scores, dim=-1)
-    
-    # Apply attention weights to values
-    output = torch.matmul(attention_weights, V)
-    
-    return output
+        return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
 
 
-def pytorch_flash_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-    return F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+class CustomAttentionImplementation(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Custom attention implementation for comparison.
+        This is a basic implementation that can be extended with more sophisticated attention mechanisms.
+        """
+        d_k = K.shape[-1]
+        
+        # Compute attention scores
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_k)
+        if mask is not None:
+            scores = torch.where(mask == 1, scores, float("-inf"))
+            
+        # Apply softmax
+        attention_weights = F.softmax(scores, dim=-1)
+        
+        # Apply attention weights to values
+        output = torch.matmul(attention_weights, V)
+        
+        return output
+
+
+class PytorchFlashAttention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        return F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+
+
+class CompiledScaledDotProductAttention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.compiled_attention = None
+        self._is_prepared = False
+    
+    def prepare(self):
+        """Prepare the compiled attention model to avoid recompilation during benchmarking."""
+        if not self._is_prepared:
+            self.compiled_attention = torch.compile(ScaledDotProductAttention())
+            self._is_prepared = True
+    
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        if not self._is_prepared:
+            self.prepare()
+        if self.compiled_attention is not None:
+            return self.compiled_attention(Q, K, V, mask)
+        else:
+            # Fallback to non-compiled version if compilation failed
+            attention = ScaledDotProductAttention()
+            return attention(Q, K, V, mask)
