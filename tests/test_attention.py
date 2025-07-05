@@ -57,8 +57,9 @@ def _test_flash_forward_pass(impl, device="cpu", is_causal=False):
     torch.testing.assert_close(l, l_ref, rtol=1e-2, atol=1e-2)
 
 
-def test_flash_forward_pass_pytorch():
-    _test_flash_forward_pass(get_flashattention_autograd_function_pytorch().apply)
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_flash_forward_pass_pytorch(is_causal):
+    _test_flash_forward_pass(get_flashattention_autograd_function_pytorch().apply, is_causal=is_causal)
 
 
 @pytest.mark.skipif(
