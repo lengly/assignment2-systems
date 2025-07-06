@@ -46,7 +46,7 @@ class CustomAttentionImplementation(torch.nn.Module):
         # Compute attention scores
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_k)
         if mask is not None:
-            scores = torch.where(mask == 1, scores, float("-inf"))
+            scores = torch.where(mask == 0, scores, float("-inf"))
             
         # Apply softmax
         attention_weights = F.softmax(scores, dim=-1)
