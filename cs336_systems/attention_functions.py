@@ -4,6 +4,10 @@ import math
 from einops import einsum
 import torch.nn.functional as F
 
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
+from flashattention import CustomFlashAttentTriton, CustomFlashAttentPytorch
+
 def softmax(x, dim=-1):
     rescaled_input = x - torch.max(x, dim=dim, keepdim=True)[0]
     exponentiated_rescaled_input = torch.exp(rescaled_input)
@@ -62,7 +66,8 @@ class PytorchFlashAttention(torch.nn.Module):
         super().__init__()
     
     def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        return F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            return F.scaled_dot_product_attention(Q, K, V, is_causal=True)
 
 
 class CompiledScaledDotProductAttention(torch.nn.Module):
@@ -86,3 +91,47 @@ class CompiledScaledDotProductAttention(torch.nn.Module):
             # Fallback to non-compiled version if compilation failed
             attention = ScaledDotProductAttention()
             return attention(Q, K, V, mask)
+
+
+def custom_flash_attn_pytorch_func(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
+    result = CustomFlashAttentPytorch.apply(Q, K, V, is_causal)
+    assert result is not None
+    return result
+
+class CusFlashAttnPy(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        result = CustomFlashAttentPytorch.apply(Q, K, V, True)
+        assert result is not None
+        return result
+
+class CusFlashAttnPyCompl(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.compiled_attention = None
+        self._is_prepared = False
+    
+    def prepare(self):
+        """Prepare the compiled attention model to avoid recompilation during benchmarking."""
+        if not self._is_prepared:
+            self.compiled_attention = torch.compile(CustomFlashAttentPytorch.apply)
+            self._is_prepared = True
+    
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        if not self._is_prepared:
+            self.prepare()
+        assert self.compiled_attention is not None
+        result = self.compiled_attention(Q, K, V, True)
+        assert result is not None
+        return result
+
+class CusFlashAttnTri(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        result = CustomFlashAttentTriton.apply(Q, K, V, True)
+        assert result is not None
+        return result

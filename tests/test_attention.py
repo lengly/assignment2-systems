@@ -59,7 +59,7 @@ def _test_flash_forward_pass(impl, device="cpu", is_causal=False):
 
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_flash_forward_pass_pytorch(is_causal):
-    _test_flash_forward_pass(get_flashattention_autograd_function_pytorch().apply, is_causal=is_causal)
+    _test_flash_forward_pass(get_flashattention_autograd_function_pytorch().apply, device="cuda", is_causal=is_causal)
 
 
 @pytest.mark.skipif(
@@ -80,9 +80,9 @@ def flash_backward_results(impl, is_causal, device=None):
 
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_flash_backward_pytorch(is_causal):
-    dq_expected, dk_expected, dv_expected = flash_backward_results(lambda *args: _attention_and_lse(*args)[0], is_causal=is_causal)
+    dq_expected, dk_expected, dv_expected = flash_backward_results(lambda *args: _attention_and_lse(*args)[0], device="cuda", is_causal=is_causal)
 
-    q, k, v, do = _make_attn_inputs()
+    q, k, v, do = _make_attn_inputs(device="cuda")
     get_flashattention_autograd_function_pytorch().apply(q, k, v, is_causal).backward(do)
 
     torch.testing.assert_close(dq_expected, q.grad, rtol=1e-2, atol=1e-2)

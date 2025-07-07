@@ -128,7 +128,7 @@ def flash_attn_fwd_kernel(
     l_expanded = tl.expand_dims(l, 1)
     tl.store(output_block_ptr, (o / l_expanded).to(output_block_ptr.type.element_ty))
     # L is the log-sum-exp of all attention scores for each query
-    tl.store(L_block_ptr, m + tl.log(l))
+    tl.store(L_block_ptr, (m + tl.log(l)).to(L_block_ptr.type.element_ty))
 
 
 # (A * B).sum(axis=-1)
@@ -182,7 +182,7 @@ def flash_attn_bwd_preprocess_kernel(
         A_block_ptr = A_block_ptr.advance((0, D_TILE_SIZE))
         B_block_ptr = B_block_ptr.advance((0, D_TILE_SIZE))
         
-    tl.store(output_block_ptr, output)
+    tl.store(output_block_ptr, output.to(output_block_ptr.type.element_ty))
 
 
 @triton.jit
@@ -299,13 +299,13 @@ def flash_attn_bwd_dQ_kernel(
         p = tl.exp(s - L_block_expanded)   # (Q_TILE_SIZE, K_TILE_SIZE)
         dp_block = tl.dot(do_block, v_block.T)   # (Q_TILE_SIZE, K_TILE_SIZE)
         ds_block = p * (dp_block - D_block_expanded) * scale
-        dq_block = tl.dot(ds_block, k_block, acc=dq_block)
+        dq_block = tl.dot(ds_block.to(k_block.dtype), k_block, acc=dq_block)
 
         # update pointers
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
     
-    tl.store(dQ_block_ptr, dq_block)
+    tl.store(dQ_block_ptr, dq_block.to(dQ_block_ptr.type.element_ty))
 
 
 @triton.jit
@@ -432,8 +432,8 @@ def flash_attn_bwd_dKV_kernel(
         p = tl.exp(s - L_block_expanded)   # (Q_TILE_SIZE, K_TILE_SIZE)
         dp_block = tl.dot(do_block, v_block.T)   # (Q_TILE_SIZE, K_TILE_SIZE)
         ds_block = p * (dp_block - D_block_expanded) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
-        dv_block = tl.dot(p.T, do_block, acc=dv_block)  # (K_TILE_SIZE, D)
-        dk_block = tl.dot(ds_block.T, q_block, acc=dk_block)  # (K_TILE_SIZE, D)
+        dv_block = tl.dot(p.T.to(do_block.dtype), do_block, acc=dv_block)  # (K_TILE_SIZE, D)
+        dk_block = tl.dot(ds_block.T.to(q_block.dtype), q_block, acc=dk_block)  # (K_TILE_SIZE, D)
 
         # update pointers
         Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
@@ -441,24 +441,34 @@ def flash_attn_bwd_dKV_kernel(
         L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE,))
         D_block_ptr = D_block_ptr.advance((Q_TILE_SIZE,))
 
-    tl.store(dK_block_ptr, dk_block)
-    tl.store(dV_block_ptr, dv_block)
+    tl.store(dK_block_ptr, dk_block.to(dK_block_ptr.type.element_ty))
+    tl.store(dV_block_ptr, dv_block.to(dV_block_ptr.type.element_ty))
 
 
 class CustomFlashAttentTriton(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, is_causal: bool = False) -> torch.Tensor:
+        if Q.ndim == 4:
+            ctx.is_4d = True
+            B, nh, Nq, d = Q.shape
+            Q = rearrange(Q, "B nh Nq d -> (B nh) Nq d")
+            K = rearrange(K, "B nh Nk d -> (B nh) Nk d")
+            V = rearrange(V, "B nh Nk d -> (B nh) Nk d")
+        else:
+            ctx.is_4d = False
+            B, Nq, d = Q.shape
+
         assert Q.is_cuda and K.is_cuda and V.is_cuda
         assert Q.is_contiguous() and K.is_contiguous() and V.is_contiguous()
         
-        B, Nq, d = Q.shape
+        # B, Nq, d = Q.shape
         Nk = K.shape[-2]
         assert K.shape[-1] == V.shape[-1] == d
 
         scale = 1 / (d ** 0.5)
 
-        Bq = 16
-        Bk = 16
+        Bq = 32
+        Bk = 32
         assert d % Bq == 0 and d % Bk == 0
         Tq = (Nq + Bq - 1) // Bq
         Tk = (Nk + Bk - 1) // Bk
@@ -484,23 +494,32 @@ class CustomFlashAttentTriton(torch.autograd.Function):
 
         ctx.save_for_backward(L, Q, K, V, output)
         ctx.is_causal = is_causal
-        return output
+        if ctx.is_4d:
+            return rearrange(output, "(B nh) Nq d -> B nh Nq d", B=B)
+        else:
+            return output
     
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        if ctx.is_4d:
+            B, nh = grad_output.shape[:2]
+            grad_output = rearrange(grad_output, "B nh Nq d -> (B nh) Nq d")
+        else:
+            B, Nq, d = grad_output.shape
+
         L, Q, K, V, O = ctx.saved_tensors
         is_causal = ctx.is_causal
         assert L.is_cuda and Q.is_cuda and K.is_cuda and V.is_cuda and O.is_cuda
         assert L.is_contiguous() and Q.is_contiguous() and K.is_contiguous() and V.is_contiguous() and O.is_contiguous()
         
-        B, Nq, d = Q.shape
+        Nq, d = Q.shape[-2:]
         Nk = K.shape[-2]
         assert K.shape[-1] == V.shape[-1] == d
         
         scale = 1 / (d ** 0.5)
 
-        Bq = 16
-        Bk = 16
+        Bq = 32
+        Bk = 32
         assert d % Bq == 0 and d % Bk == 0
         Tq = (Nq + Bq - 1) // Bq
         Tk = (Nk + Bk - 1) // Bk
@@ -564,6 +583,10 @@ class CustomFlashAttentTriton(torch.autograd.Function):
             is_causal=is_causal,
         )
 
+        if ctx.is_4d:
+            dQ = rearrange(dQ, "(B nh) Nq d -> B nh Nq d", B=B)
+            dK = rearrange(dK, "(B nh) Nk d -> B nh Nk d", B=B)
+            dV = rearrange(dV, "(B nh) Nk d -> B nh Nk d", B=B)
         return dQ, dK, dV, None
 
 
@@ -584,15 +607,15 @@ class CustomFlashAttentPytorch(torch.autograd.Function):
         Tk = (Nk + Bk - 1) // Bk
 
         output = torch.empty_like(Q)
-        L = torch.zeros((B, Nq))
+        L = torch.zeros((B, Nq), device=Q.device, dtype=Q.dtype)
 
         for i in range(Tq):
             q_start = i * Bq
             q_end = min(q_start + Bq, Nq)
             q = Q[..., q_start:q_end, :]
-            o = torch.zeros((B, q_end - q_start, d))
-            l = torch.zeros((B, q_end - q_start,))
-            m = torch.full((B, q_end - q_start,), float("-inf"))
+            o = torch.zeros((B, q_end - q_start, d), device=Q.device, dtype=Q.dtype)
+            l = torch.zeros((B, q_end - q_start,), device=Q.device, dtype=Q.dtype)
+            m = torch.full((B, q_end - q_start,), float("-inf"), device=Q.device, dtype=Q.dtype)
 
             for j in range(Tk):
                 k_start = j * Bk

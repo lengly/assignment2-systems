@@ -11,7 +11,6 @@ This script benchmarks attention functions at different scales:
 """
 
 import torch
-torch.backends.cuda.sdp_kernel.enable_flash = True
 import torch.nn as nn
 import torch.nn.functional as F
 import time
@@ -29,14 +28,15 @@ from attention_functions import (
     CustomAttentionImplementation,
     PytorchFlashAttention,
     CompiledScaledDotProductAttention,
+    CusFlashAttnTri,
 )
 
-
 benchmark_class_dict = {
-    "CompiledScaledDotProductAttention": CompiledScaledDotProductAttention,
-    "ScaledDotProductAttention": ScaledDotProductAttention,
-    "CustomAttentionImplementation": CustomAttentionImplementation,
+    # "CompiledScaledDotProductAttention": CompiledScaledDotProductAttention,
+    # "ScaledDotProductAttention": ScaledDotProductAttention,
+    # "CustomAttentionImplementation": CustomAttentionImplementation,
     "PytorchFlashAttention": PytorchFlashAttention,
+    "CusFlashAttnTri": CusFlashAttnTri,
 }
 
 @dataclass
@@ -52,7 +52,7 @@ class BenchmarkConfig:
     
     def __post_init__(self):
         if self.d_model_values is None:
-            self.d_model_values = [16, 32, 64, 128]
+            self.d_model_values = [64, 128, 256, 512]
         if self.seq_len_values is None:
             self.seq_len_values = [256, 1024, 4096, 8192, 16384]
 
@@ -67,14 +67,14 @@ def get_memory_usage() -> float:
         return process.memory_info().rss / 1024 / 1024
 
 
-def create_attention_inputs(batch_size: int, seq_len: int, d_model: int, device: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def create_attention_inputs(batch_size: int, num_head: int, seq_len: int, d_model: int, device: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Create random Q, K, V tensors for attention computation."""
     torch.manual_seed(42)  # For reproducible results
     
     # Create tensors with shape (batch_size, seq_len, d_model)
-    Q = torch.randn(batch_size, seq_len, d_model, device=device, requires_grad=True, dtype=torch.bfloat16)
-    K = torch.randn(batch_size, seq_len, d_model, device=device, requires_grad=True, dtype=torch.bfloat16)
-    V = torch.randn(batch_size, seq_len, d_model, device=device, requires_grad=True, dtype=torch.bfloat16)
+    Q = torch.randn(batch_size, num_head, seq_len, d_model, device=device, requires_grad=True, dtype=torch.bfloat16)
+    K = torch.randn(batch_size, num_head, seq_len, d_model, device=device, requires_grad=True, dtype=torch.bfloat16)
+    V = torch.randn(batch_size, num_head, seq_len, d_model, device=device, requires_grad=True, dtype=torch.bfloat16)
     
     return Q, K, V
 
@@ -253,7 +253,7 @@ def run_attention_benchmarks(config: BenchmarkConfig) -> List[Dict]:
         
         try:
             # Create inputs
-            Q, K, V = create_attention_inputs(config.batch_size, seq_len, d_model, device)
+            Q, K, V = create_attention_inputs(config.batch_size, d_model // 16, seq_len, d_model, device)
             
             # Calculate theoretical memory usage
             theoretical_memory = calculate_memory_usage_theoretical(config.batch_size, seq_len, d_model)
