@@ -19,7 +19,7 @@ def test_timing_flash_forward_backward():
     
     print("Timing flash forward backward...")
     results = triton.testing.do_bench(flash_forward_backward, warmup=100, rep=100)
-    print(results)
+    print(results)  # 18ms with Bq = 64, Bk = 64
 
 if __name__ == "__main__":
     test_timing_flash_forward_backward()

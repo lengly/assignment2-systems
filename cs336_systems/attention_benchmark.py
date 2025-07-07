@@ -32,9 +32,9 @@ from attention_functions import (
 )
 
 benchmark_class_dict = {
-    # "CompiledScaledDotProductAttention": CompiledScaledDotProductAttention,
-    # "ScaledDotProductAttention": ScaledDotProductAttention,
-    # "CustomAttentionImplementation": CustomAttentionImplementation,
+    "CompiledScaledDotProductAttention": CompiledScaledDotProductAttention,
+    "ScaledDotProductAttention": ScaledDotProductAttention,
+    "CustomAttentionImplementation": CustomAttentionImplementation,
     "PytorchFlashAttention": PytorchFlashAttention,
     "CusFlashAttnTri": CusFlashAttnTri,
 }
@@ -46,8 +46,8 @@ class BenchmarkConfig:
     d_model_values: Optional[List[int]] = None
     seq_len_values: Optional[List[int]] = None
     num_warmup: int = 10
-    num_forward_passes: int = 100
-    num_backward_passes: int = 100
+    num_forward_passes: int = 10
+    num_backward_passes: int = 10
     device: str = 'cuda'
     
     def __post_init__(self):
@@ -100,7 +100,7 @@ def benchmark_attention_function(
         Dictionary with benchmark results
     """
     device = Q.device
-    casual_mask = torch.triu(torch.ones(Q.shape[1], K.shape[1], device=device), diagonal=1)
+    casual_mask = torch.triu(torch.ones(Q.shape[-2], K.shape[-2], device=device), diagonal=1)
     
     # Warmup phase
     model = attention_cls()

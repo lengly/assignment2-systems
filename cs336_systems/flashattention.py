@@ -469,7 +469,7 @@ class CustomFlashAttentTriton(torch.autograd.Function):
 
         Bq = 32
         Bk = 32
-        assert d % Bq == 0 and d % Bk == 0
+        assert Nq % Bq == 0 and Nk % Bk == 0
         Tq = (Nq + Bq - 1) // Bq
         Tk = (Nk + Bk - 1) // Bk
 
@@ -520,7 +520,7 @@ class CustomFlashAttentTriton(torch.autograd.Function):
 
         Bq = 32
         Bk = 32
-        assert d % Bq == 0 and d % Bk == 0
+        assert Nq % Bq == 0 and Nk % Bk == 0
         Tq = (Nq + Bq - 1) // Bq
         Tk = (Nk + Bk - 1) // Bk
 
