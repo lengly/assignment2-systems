@@ -5,6 +5,7 @@ Measures training time and communication overhead for distributed data parallel 
 """
 
 import argparse
+from time import sleep
 import timeit
 import torch
 import torch.distributed as dist
@@ -28,37 +29,63 @@ mp.set_start_method('spawn', force=True)
 # os.environ["NCCL_P2P_DISABLE"] = "1"
 # os.environ["NCCL_SHM_DISABLE"] = "1"
 
+# 'naive'  'flatten'  'overlap_individual'  'overlap_bucketed'
+DDP_TYPE_1 = 'naive'
+DDP_TYPE_2 = 'flatten'
+DDP_TYPE_3 = 'overlap_individual'
+DDP_TYPE_4 = 'overlap_bucketed'
+
 
 class NaiveDDP(nn.Module):
     """Naive Distributed Data Parallel implementation that all-reduces gradients after backward pass."""
     
-    def __init__(self, module: nn.Module):
+    def __init__(self, module: nn.Module, ddp_type: str = 'overlap_individual'):
         super().__init__()
         self.module = module
         self.world_size = dist.get_world_size()
-        
+        for name, param in self.module.named_parameters():
+            dist.broadcast(param.data, src=0)
+        self.ddp_type = ddp_type
+        if self.ddp_type == 'overlap_individual':
+            for param in self.module.parameters():
+                if param.requires_grad:
+                    param.register_post_accumulate_grad_hook(self.post_accumulate_grad_hook)
+            self.handles = []
+    
+    def post_accumulate_grad_hook(self, param):
+        param.grad /= self.world_size
+        handle = dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, async_op=True)
+        self.handles.append(handle)
+    
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
-    
-    def all_reduce_gradients(self):
-        """All-reduce gradients for all parameters that require gradients."""
+
+    def finish_gradient_synchronization(self):
+        if self.ddp_type == 'overlap_individual':
+            for handle in self.handles:
+                handle.wait()
+            self.handles = []
+
         # ================================================================================
         # Naive DDP Implementation with Reducing the Number of Communication Calls
         # ================================================================================
-        params = []
-        for param in self.module.parameters():
-            if param.requires_grad and param.grad is not None:
-                params.append(param.grad)
-        flattened_params = _flatten_dense_tensors(params)
-        dist.all_reduce(flattened_params, op=dist.ReduceOp.AVG)
-        _unflatten_dense_tensors(flattened_params, params)
+        # if self.ddp_type == 'flatten':
+        #     params = []
+        #     for param in self.module.parameters():
+        #         if param.requires_grad and param.grad is not None:
+        #             params.append(param.grad)
+        #     flattened_params = _flatten_dense_tensors(params)
+        #     dist.all_reduce(flattened_params, op=dist.ReduceOp.AVG)
+        #     _unflatten_dense_tensors(flattened_params, params)
 
         # ================================================================================
         # Naive DDP Implementation
         # ================================================================================
-        # for param in self.module.parameters():
-        #     if param.requires_grad and param.grad is not None:
-        #         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        # if self.ddp_type == 'naive':
+        #     for param in self.module.parameters():
+        #         if param.requires_grad and param.grad is not None:
+        #             dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+        #             param.grad /= self.world_size
 
 
 
@@ -156,7 +183,7 @@ def benchmark_ddp_training(
         logits = ddp_model(batch)
         loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
         loss.backward()
-        ddp_model.all_reduce_gradients()
+        ddp_model.finish_gradient_synchronization()
         optimizer.step()
         torch.cuda.synchronize()
     
@@ -189,7 +216,7 @@ def benchmark_ddp_training(
         
         # Communication timing
         start_comm = timeit.default_timer()
-        ddp_model.all_reduce_gradients()
+        ddp_model.finish_gradient_synchronization()
         torch.cuda.synchronize()
         end_comm = timeit.default_timer()
         communication_times.append(end_comm - start_comm)
