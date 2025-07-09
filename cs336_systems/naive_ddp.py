@@ -5,8 +5,8 @@ import torch.optim as optim
 import multiprocessing as mp
 import os
 import os
-os.environ["NCCL_P2P_DISABLE"] = "1"
-os.environ["NCCL_SHM_DISABLE"] = "1"
+# os.environ["NCCL_P2P_DISABLE"] = "1"
+# os.environ["NCCL_SHM_DISABLE"] = "1"
 from copy import deepcopy
 
 # Set multiprocessing start method to spawn for CUDA compatibility

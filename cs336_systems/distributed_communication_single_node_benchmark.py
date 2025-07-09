@@ -1,6 +1,6 @@
 import os
-os.environ["NCCL_P2P_DISABLE"] = "1"
-os.environ["NCCL_SHM_DISABLE"] = "1"
+# os.environ["NCCL_P2P_DISABLE"] = "1"
+# os.environ["NCCL_SHM_DISABLE"] = "1"
 
 import time
 import torch
@@ -40,8 +40,8 @@ def setup(rank: int, world_size: int, backend: str = "gloo"):
         os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
         os.environ['TORCH_NCCL_BLOCKING_WAIT'] = '1'
         # Disable P2P and shared memory for stability in container environments
-        os.environ['NCCL_P2P_DISABLE'] = '1'
-        os.environ['NCCL_SHM_DISABLE'] = '1'
+        # os.environ['NCCL_P2P_DISABLE'] = '1'
+        # os.environ['NCCL_SHM_DISABLE'] = '1'
     
     if backend == "nccl" and not torch.cuda.is_available():
         raise RuntimeError("NCCL backend requires CUDA to be available")
@@ -187,7 +187,7 @@ def run_comprehensive_benchmark():
     backends = ["gloo", "nccl"]
     device_types = ["cpu", "gpu"]
     data_sizes_mb = [1, 10, 100, 1000]  # 1MB, 10MB, 100MB, 1GB
-    world_sizes = [2, 4, 6]
+    world_sizes = [2]
     
     results = []
     
@@ -444,3 +444,35 @@ if __name__ == "__main__":
     main()
 
 
+# ALL-REDUCE BENCHMARK RESULTS @ Nvidia RTX 4090*2 (24GB)
+# ================================================================================
+
+# GLOO + CPU
+# --------------------------------------------------
+# Data Size (MB) | Processes -> Time (ms)
+#                |   2  |
+# --------------------------------------------------------|
+#             1 |   4.6 |
+#            10 |   9.5 |
+#           100 |  97.1 |
+#          1000 | 1010.9 |
+
+# GLOO + GPU
+# --------------------------------------------------
+# Data Size (MB) | Processes -> Time (ms)
+#                |   2  |
+# --------------------------------------------------------|
+#             1 |   1.2 |
+#            10 |   8.2 |
+#           100 | 143.3 |
+#          1000 | 1316.7 |
+
+# NCCL + GPU
+# --------------------------------------------------
+# Data Size (MB) | Processes -> Time (ms)
+#                |   2  |
+# --------------------------------------------------------|
+#             1 |   1.2 |
+#            10 |   3.3 |
+#           100 |  23.4 |
+#          1000 | 224.5 |

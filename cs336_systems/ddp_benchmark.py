@@ -23,9 +23,9 @@ from cs336_basics.model import BasicsTransformerLM
 # Set multiprocessing start method to spawn for CUDA compatibility
 mp.set_start_method('spawn', force=True)
 
-# Disable NCCL P2P and shared memory for single-node testing
-os.environ["NCCL_P2P_DISABLE"] = "1"
-os.environ["NCCL_SHM_DISABLE"] = "1"
+# # Disable NCCL P2P and shared memory for single-node testing
+# os.environ["NCCL_P2P_DISABLE"] = "1"
+# os.environ["NCCL_SHM_DISABLE"] = "1"
 
 
 class NaiveDDP(nn.Module):
@@ -211,6 +211,26 @@ def benchmark_ddp_training(
     return results
 
 
+def benchmark_ddp_worker(rank: int, world_size: int, config: Dict[str, Any], 
+                        batch_size: int, seq_len: int, num_warmup: int, num_steps: int,
+                        results_queue: mp.Queue):
+    """Worker function for DDP benchmarking that can be pickled."""
+    try:
+        results = benchmark_ddp_training(
+            rank=rank,
+            world_size=world_size,
+            config=config,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            num_warmup=num_warmup,
+            num_steps=num_steps
+        )
+        results_queue.put((rank, results))
+    except Exception as e:
+        print(f"Error in process {rank}: {e}")
+        results_queue.put((rank, None))
+
+
 def benchmark_single_process(
     config: Dict[str, Any],
     batch_size: int,
@@ -303,7 +323,8 @@ def print_results(
     ddp_results: Dict[str, float],
     config: Dict[str, Any],
     batch_size: int,
-    world_size: int
+    world_size: int,
+    model_type: str
 ):
     """Print benchmarking results in a formatted way."""
     print("\n" + "="*80)
@@ -311,7 +332,7 @@ def print_results(
     print("="*80)
     
     # Model configuration
-    print(f"Model Configuration (XL size):")
+    print(f"Model Configuration ({model_type}):")
     print(f"  - Vocab size: {config['vocab_size']:,}")
     print(f"  - Context length: {config['context_length']:,}")
     print(f"  - d_model: {config['d_model']:,}")
@@ -358,14 +379,10 @@ def print_results(
 def main():
     parser = argparse.ArgumentParser(description='Benchmark naive DDP implementation')
     
-    # Model hyperparameters (XL size from benchmarking_script.py)
-    parser.add_argument('--vocab_size', type=int, default=10000, help='Vocabulary size')
-    parser.add_argument('--context_length', type=int, default=512, help='Context length')
-    parser.add_argument('--d_model', type=int, default=768, help='Model dimension')
-    parser.add_argument('--num_layers', type=int, default=12, help='Number of layers')
-    parser.add_argument('--num_heads', type=int, default=12, help='Number of attention heads')
-    parser.add_argument('--d_ff', type=int, default=3072, help='Feed-forward dimension')
-    parser.add_argument('--rope_theta', type=float, default=10000.0, help='RoPE theta parameter')
+    # Model configuration
+    parser.add_argument('--model_type', type=str, default='gpt2', 
+                       choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'],
+                       help='GPT-2 model size to benchmark')
     
     # Benchmarking parameters
     parser.add_argument('--batch_size', type=int, default=8, help='Total batch size across all processes')
@@ -381,19 +398,27 @@ def main():
         print("CUDA not available, falling back to CPU")
         return
     
+    # GPT-2 model configurations
+    config_args = {
+        'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+        'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
+        'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
+        'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+    }[args.model_type]
+    
     # Create model configuration
     config = {
-        'vocab_size': args.vocab_size,
-        'context_length': args.context_length,
-        'd_model': args.d_model,
-        'num_layers': args.num_layers,
-        'num_heads': args.num_heads,
-        'd_ff': args.d_ff,
-        'rope_theta': args.rope_theta
+        'vocab_size': 50257,  # GPT-2 vocabulary size
+        'context_length': args.seq_len,
+        'd_model': config_args['n_embd'],
+        'num_layers': config_args['n_layer'],
+        'num_heads': config_args['n_head'],
+        'd_ff': config_args['n_embd'] * 4,  # Standard GPT-2 FF dimension
+        'rope_theta': 10000.0
     }
     
     print("Benchmarking Setup:")
-    print(f"  - Model: XL size Transformer ({config['d_model']} dim, {config['num_layers']} layers)")
+    print(f"  - Model: {args.model_type} ({config['d_model']} dim, {config['num_layers']} layers)")
     print(f"  - Batch size: {args.batch_size} (total across {args.world_size} GPUs)")
     print(f"  - Sequence length: {args.seq_len}")
     print(f"  - Warm-up steps: {args.num_warmup}")
@@ -412,27 +437,30 @@ def main():
     # Benchmark DDP training
     print("\nBenchmarking DDP training...")
     processes = []
-    ddp_results_list = []
+    results_queue = mp.Queue()
     
     for rank in range(args.world_size):
         p = mp.Process(
-            target=lambda rank=rank: ddp_results_list.append(
-                benchmark_ddp_training(
-                    rank=rank,
-                    world_size=args.world_size,
-                    config=config,
-                    batch_size=args.batch_size,
-                    seq_len=args.seq_len,
-                    num_warmup=args.num_warmup,
-                    num_steps=args.num_steps
-                )
-            )
+            target=benchmark_ddp_worker,
+            args=(rank, args.world_size, config, args.batch_size, args.seq_len, 
+                  args.num_warmup, args.num_steps, results_queue)
         )
         p.start()
         processes.append(p)
     
     for p in processes:
         p.join()
+    
+    # Collect results from queue
+    ddp_results_list = []
+    for _ in range(args.world_size):
+        rank, results = results_queue.get()
+        if results is not None:
+            ddp_results_list.append(results)
+    
+    if not ddp_results_list:
+        print("Error: No valid results from DDP processes")
+        return
     
     # Average results across all processes
     ddp_results = {}
@@ -441,8 +469,51 @@ def main():
         ddp_results[key] = np.mean(values)
     
     # Print results
-    print_results(single_results, ddp_results, config, args.batch_size, args.world_size)
+    print_results(single_results, ddp_results, config, args.batch_size, args.world_size, args.model_type)
 
 
 if __name__ == '__main__':
     main() 
+
+
+
+# ================================================================================
+# DDP BENCHMARKING RESULTS @ Nvidia RTX 4090*2 (24GB)
+# ================================================================================
+# Model Configuration (gpt2):
+#   - Vocab size: 50,257
+#   - Context length: 512
+#   - d_model: 768
+#   - Num layers: 12
+#   - Num heads: 12
+#   - d_ff: 3,072
+#   - Rope theta: 10000.0
+
+# Training Configuration:
+#   - Total batch size: 8
+#   - World size: 2
+#   - Local batch size: 4
+
+# ================================================================================
+# Naive DDP Implementation
+# ================================================================================
+
+# Single Process Results:
+#   - Forward pass: 66.530 ± 0.307 ms
+#   - Backward pass: 128.165 ± 0.284 ms
+#   - Total time per step: 194.696 ± 0.500 ms
+#   - Throughput: 5.14 steps/s
+
+# DDP Results (2 GPUs):
+#   - Forward pass: 35.646 ± 2.183 ms
+#   - Backward pass: 65.135 ± 0.291 ms
+#   - Communication: 159.884 ± 1.870 ms
+#   - Total time per step: 260.667 ± 2.715 ms
+#   - Throughput: 3.84 steps/s
+
+# Communication Overhead Analysis:
+#   - Communication time: 159.884 ms
+#   - Communication overhead: 61.34%
+#   - Speedup vs single GPU: 0.75x
+#   - Scaling efficiency: 37.35%
+# ================================================================================
