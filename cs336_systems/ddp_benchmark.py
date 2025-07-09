@@ -11,6 +11,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.multiprocessing as mp
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 import os
 import sys
 from typing import Dict, Any, List
@@ -41,10 +42,24 @@ class NaiveDDP(nn.Module):
     
     def all_reduce_gradients(self):
         """All-reduce gradients for all parameters that require gradients."""
+        # ================================================================================
+        # Naive DDP Implementation with Reducing the Number of Communication Calls
+        # ================================================================================
+        params = []
         for param in self.module.parameters():
             if param.requires_grad and param.grad is not None:
-                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-                param.grad.data /= self.world_size
+                params.append(param.grad)
+        flattened_params = _flatten_dense_tensors(params)
+        dist.all_reduce(flattened_params, op=dist.ReduceOp.AVG)
+        _unflatten_dense_tensors(flattened_params, params)
+
+        # ================================================================================
+        # Naive DDP Implementation
+        # ================================================================================
+        # for param in self.module.parameters():
+        #     if param.requires_grad and param.grad is not None:
+        #         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+
 
 
 def setup_process_group(rank: int, world_size: int):
@@ -495,7 +510,7 @@ if __name__ == '__main__':
 #   - Local batch size: 4
 
 # ================================================================================
-# Naive DDP Implementation
+# Baseline: Single Process Training
 # ================================================================================
 
 # Single Process Results:
@@ -503,6 +518,10 @@ if __name__ == '__main__':
 #   - Backward pass: 128.165 ± 0.284 ms
 #   - Total time per step: 194.696 ± 0.500 ms
 #   - Throughput: 5.14 steps/s
+
+# ================================================================================
+# Naive DDP Implementation
+# ================================================================================
 
 # DDP Results (2 GPUs):
 #   - Forward pass: 35.646 ± 2.183 ms
@@ -516,4 +535,20 @@ if __name__ == '__main__':
 #   - Communication overhead: 61.34%
 #   - Speedup vs single GPU: 0.75x
 #   - Scaling efficiency: 37.35%
+
 # ================================================================================
+# Naive DDP Implementation with Reducing the Number of Communication Calls
+# ================================================================================
+
+# DDP Results (2 GPUs):
+#   - Forward pass: 39.623 ± 5.194 ms
+#   - Backward pass: 65.417 ± 0.721 ms
+#   - Communication: 145.125 ± 3.153 ms
+#   - Total time per step: 250.167 ± 5.297 ms
+#   - Throughput: 4.00 steps/s
+
+# Communication Overhead Analysis:
+#   - Communication time: 145.125 ms
+#   - Communication overhead: 58.01%
+#   - Speedup vs single GPU: 0.78x
+#   - Scaling efficiency: 38.99%
