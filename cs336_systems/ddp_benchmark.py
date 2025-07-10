@@ -35,22 +35,92 @@ DDP_TYPE_2 = 'flatten'
 DDP_TYPE_3 = 'overlap_individual'
 DDP_TYPE_4 = 'overlap_bucketed'
 
+class Bucket:
+    def __init__(self, module: nn.Module, bucket_size_mb: float, world_size: int):
+        self.bucket_size_bytes = bucket_size_mb * 1024 * 1024
+        self.bucket = []
+        self.bucket_count = []
+        self.param_to_bucket = {}
+        self.bucket_ready_count = []
+        self.world_size = world_size
+        self.bucketize_parameters(module)
+        self.handles = []
+        self.bucket_handles = {}  # 存储异步 all_reduce 的 handles
+    
+    def post_accumulate_grad_hook(self, param):
+        bucket_index = self.param_to_bucket[param]
+        self.bucket_ready_count[bucket_index] += 1
+        if self.bucket_ready_count[bucket_index] == self.bucket_count[bucket_index]:
+            self.all_reduce_bucket(bucket_index)
+
+    def bucketize_parameters(self, module: nn.Module):
+        current_bucket = []
+        cur_size = 0
+        for param in reversed(list(module.parameters())):
+            if param.requires_grad:
+                param.register_post_accumulate_grad_hook(self.post_accumulate_grad_hook)
+                param_size = param.numel() * param.element_size()
+                if cur_size + param_size > self.bucket_size_bytes:
+                    self.bucket.append(current_bucket)
+                    current_bucket = []
+                    cur_size = 0
+                current_bucket.append(param)
+                cur_size += param_size
+                self.param_to_bucket[param] = len(self.bucket)
+        if cur_size > 0:
+            self.bucket.append(current_bucket)
+        self.bucket_count = [len(bucket) for bucket in self.bucket]
+        self.bucket_ready_count = [0 for _ in range(len(self.bucket))]
+        print("Num of buckets: ", len(self.bucket))
+        print("Bucket sizes: ", [len(bucket) for bucket in self.bucket])
+
+    def all_reduce_bucket(self, bucket_index: int):
+        # print("All reduce bucket: ", bucket_index)
+        grads = [p.grad for p in self.bucket[bucket_index]]
+        flattened_grads = _flatten_dense_tensors(grads)
+        handle = dist.all_reduce(flattened_grads, op=dist.ReduceOp.SUM, async_op=True)
+        self.bucket_handles[bucket_index] = {
+            'handle': handle,
+            'flattened_grads': flattened_grads,
+            'grads': grads,
+        }
+        self.bucket_ready_count[bucket_index] = 0
+    
+    def finish_gradient_synchronization(self):
+        for bucket_index in range(len(self.bucket)):
+            self.wait_bucket(bucket_index)
+    
+    def wait_bucket(self, bucket_index: int):
+        if bucket_index not in self.bucket_handles:
+            return
+        handle_info = self.bucket_handles[bucket_index]
+        handle_info['handle'].wait()  # 等待异步操作完成
+        unflattened_grads = _unflatten_dense_tensors(
+            handle_info['flattened_grads'], 
+            handle_info['grads']
+        )
+        for p, g in zip(self.bucket[bucket_index], unflattened_grads):
+            p.grad = g / self.world_size
+        del self.bucket_handles[bucket_index]
+
 
 class NaiveDDP(nn.Module):
     """Naive Distributed Data Parallel implementation that all-reduces gradients after backward pass."""
     
-    def __init__(self, module: nn.Module, ddp_type: str = 'overlap_individual'):
+    def __init__(self, module: nn.Module, bucket_size_mb: float = 20, ddp_type: str = DDP_TYPE_4):
         super().__init__()
         self.module = module
         self.world_size = dist.get_world_size()
         for name, param in self.module.named_parameters():
             dist.broadcast(param.data, src=0)
         self.ddp_type = ddp_type
-        if self.ddp_type == 'overlap_individual':
+        if self.ddp_type == DDP_TYPE_3:
             for param in self.module.parameters():
                 if param.requires_grad:
                     param.register_post_accumulate_grad_hook(self.post_accumulate_grad_hook)
             self.handles = []
+        if self.ddp_type == DDP_TYPE_4:
+            self.bucket = Bucket(self.module, bucket_size_mb, self.world_size)
     
     def post_accumulate_grad_hook(self, param):
         param.grad /= self.world_size
@@ -61,7 +131,10 @@ class NaiveDDP(nn.Module):
         return self.module(*args, **kwargs)
 
     def finish_gradient_synchronization(self):
-        if self.ddp_type == 'overlap_individual':
+        if self.ddp_type == DDP_TYPE_4:
+            self.bucket.finish_gradient_synchronization()
+            
+        if self.ddp_type == DDP_TYPE_3:
             for handle in self.handles:
                 handle.wait()
             self.handles = []
@@ -69,23 +142,27 @@ class NaiveDDP(nn.Module):
         # ================================================================================
         # Naive DDP Implementation with Reducing the Number of Communication Calls
         # ================================================================================
-        # if self.ddp_type == 'flatten':
-        #     params = []
-        #     for param in self.module.parameters():
-        #         if param.requires_grad and param.grad is not None:
-        #             params.append(param.grad)
-        #     flattened_params = _flatten_dense_tensors(params)
-        #     dist.all_reduce(flattened_params, op=dist.ReduceOp.AVG)
-        #     _unflatten_dense_tensors(flattened_params, params)
+        if self.ddp_type == DDP_TYPE_2:
+            params = []
+            param_list = []
+            for param in self.module.parameters():
+                if param.requires_grad and param.grad is not None:
+                    params.append(param.grad)
+                    param_list.append(param)
+            flattened_params = _flatten_dense_tensors(params)
+            dist.all_reduce(flattened_params, op=dist.ReduceOp.SUM)
+            unflattened_params = _unflatten_dense_tensors(flattened_params, params)
+            for param, unflattened_grad in zip(param_list, unflattened_params):
+                param.grad = unflattened_grad / self.world_size
 
         # ================================================================================
         # Naive DDP Implementation
         # ================================================================================
-        # if self.ddp_type == 'naive':
-        #     for param in self.module.parameters():
-        #         if param.requires_grad and param.grad is not None:
-        #             dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-        #             param.grad /= self.world_size
+        if self.ddp_type == DDP_TYPE_1:
+            for param in self.module.parameters():
+                if param.requires_grad and param.grad is not None:
+                    dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+                    param.grad /= self.world_size
 
 
 
