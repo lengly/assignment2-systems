@@ -13,10 +13,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.multiprocessing as mp
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+from torch.amp import autocast, GradScaler
 import os
 import sys
 from typing import Dict, Any, List
 import numpy as np
+import threading
+import queue
 
 # Add the cs336-basics directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'cs336-basics'))
@@ -36,16 +39,23 @@ DDP_TYPE_3 = 'overlap_individual'
 DDP_TYPE_4 = 'overlap_bucketed'
 
 class Bucket:
-    def __init__(self, module: nn.Module, bucket_size_mb: float, world_size: int):
+    def __init__(self, module: nn.Module, bucket_size_mb: float, world_size: int, use_async_processing: bool = False):
         self.bucket_size_bytes = bucket_size_mb * 1024 * 1024
         self.bucket = []
         self.bucket_count = []
         self.param_to_bucket = {}
         self.bucket_ready_count = []
         self.world_size = world_size
+        self.use_async_processing = use_async_processing
         self.bucketize_parameters(module)
         self.handles = []
-        self.bucket_handles = {}  # 存储异步 all_reduce 的 handles
+        self.bucket_handles = {}  # Store async all_reduce handles
+        
+        # Background processing thread (only created when async processing is enabled)
+        if self.use_async_processing:
+            self.worker_queue = queue.Queue()
+            self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+            self.worker_thread.start()
     
     def post_accumulate_grad_hook(self, param):
         bucket_index = self.param_to_bucket[param]
@@ -85,29 +95,83 @@ class Bucket:
             'grads': grads,
         }
         self.bucket_ready_count[bucket_index] = 0
+        
+        # Submit task to background thread (only when async processing is enabled)
+        if self.use_async_processing:
+            self.worker_queue.put(bucket_index)
     
-    def finish_gradient_synchronization(self):
-        for bucket_index in range(len(self.bucket)):
-            self.wait_bucket(bucket_index)
+    def _worker_loop(self):
+        """Background worker thread that processes gradient computation and parameter copying after all_reduce completion"""
+        while True:
+            try:
+                bucket_index = self.worker_queue.get()
+                if bucket_index is None:  # Exit signal
+                    self.worker_queue.task_done()
+                    break
+                self._process_bucket(bucket_index)
+                self.worker_queue.task_done()  # Mark task as done
+            except Exception as e:
+                print(f"Error in worker thread: {e}")
+                self.worker_queue.task_done()  # Mark task as done even if error occurs
     
-    def wait_bucket(self, bucket_index: int):
+    def _process_bucket(self, bucket_index: int):
+        """Process gradient computation and parameter copying for a single bucket"""
         if bucket_index not in self.bucket_handles:
             return
+        
         handle_info = self.bucket_handles[bucket_index]
-        handle_info['handle'].wait()  # 等待异步操作完成
+        handle_info['handle'].wait()  # Wait for async operation to complete
+        
+        # Compute gradients and copy to parameters
         unflattened_grads = _unflatten_dense_tensors(
             handle_info['flattened_grads'], 
             handle_info['grads']
         )
         for p, g in zip(self.bucket[bucket_index], unflattened_grads):
             p.grad = g / self.world_size
+        
         del self.bucket_handles[bucket_index]
+    
+    def finish_gradient_synchronization(self):
+        """Wait for all bucket processing to complete"""
+        if self.use_async_processing:
+            # Wait for all tasks in queue to complete
+            self.worker_queue.join()
+        else:
+            # Use original method: process all buckets together
+            for bucket_index in range(len(self.bucket)):
+                self.wait_bucket(bucket_index)
+    
+    def wait_bucket(self, bucket_index: int):
+        """Process gradient computation and parameter copying for a single bucket (synchronous mode)"""
+        if bucket_index not in self.bucket_handles:
+            return
+        
+        handle_info = self.bucket_handles[bucket_index]
+        handle_info['handle'].wait()  # Wait for async operation to complete
+        
+        # Compute gradients and copy to parameters
+        unflattened_grads = _unflatten_dense_tensors(
+            handle_info['flattened_grads'], 
+            handle_info['grads']
+        )
+        for p, g in zip(self.bucket[bucket_index], unflattened_grads):
+            p.grad = g / self.world_size
+        
+        del self.bucket_handles[bucket_index]
+    
+    def cleanup(self):
+        """Clean up resources and close background thread"""
+        if self.use_async_processing:
+            self.worker_queue.put(None)  # Send exit signal
+            if self.worker_thread.is_alive():
+                self.worker_thread.join(timeout=1.0)
 
 
 class NaiveDDP(nn.Module):
     """Naive Distributed Data Parallel implementation that all-reduces gradients after backward pass."""
     
-    def __init__(self, module: nn.Module, bucket_size_mb: float = 20, ddp_type: str = DDP_TYPE_4):
+    def __init__(self, module: nn.Module, bucket_size_mb: float = 1000, ddp_type: str = DDP_TYPE_4):
         super().__init__()
         self.module = module
         self.world_size = dist.get_world_size()
@@ -121,6 +185,11 @@ class NaiveDDP(nn.Module):
             self.handles = []
         if self.ddp_type == DDP_TYPE_4:
             self.bucket = Bucket(self.module, bucket_size_mb, self.world_size)
+    
+    def cleanup(self):
+        """Clean up resources"""
+        if hasattr(self, 'bucket') and self.ddp_type == DDP_TYPE_4:
+            self.bucket.cleanup()
     
     def post_accumulate_grad_hook(self, param):
         param.grad /= self.world_size
@@ -245,6 +314,9 @@ def benchmark_ddp_training(
     # Create optimizer
     optimizer = torch.optim.AdamW(ddp_model.parameters(), lr=1e-4)
     
+    # Initialize GradScaler for mixed precision training
+    scaler = GradScaler()
+    
     # Generate data for this rank
     local_batch_size = batch_size // world_size
     batch = generate_random_batch(local_batch_size, seq_len, config['vocab_size'], device)
@@ -257,11 +329,13 @@ def benchmark_ddp_training(
     print(f"Rank {rank}: Running {num_warmup} warm-up steps...")
     for _ in range(num_warmup):
         optimizer.zero_grad()
-        logits = ddp_model(batch)
-        loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
-        loss.backward()
+        with autocast('cuda', dtype=torch.bfloat16):
+            logits = ddp_model(batch)
+            loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+        scaler.scale(loss).backward()
         ddp_model.finish_gradient_synchronization()
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         torch.cuda.synchronize()
     
     # Benchmarking phase
@@ -277,8 +351,9 @@ def benchmark_ddp_training(
         start_forward = timeit.default_timer()
         
         optimizer.zero_grad()
-        logits = ddp_model(batch)
-        loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+        with autocast('cuda', dtype=torch.bfloat16):
+            logits = ddp_model(batch)
+            loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
         
         torch.cuda.synchronize()
         end_forward = timeit.default_timer()
@@ -286,7 +361,7 @@ def benchmark_ddp_training(
         
         # Backward pass timing
         start_backward = timeit.default_timer()
-        loss.backward()
+        scaler.scale(loss).backward()
         torch.cuda.synchronize()
         end_backward = timeit.default_timer()
         backward_times.append(end_backward - start_backward)
@@ -299,7 +374,8 @@ def benchmark_ddp_training(
         communication_times.append(end_comm - start_comm)
         
         # Optimizer step
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         
         # Total time for this step
         total_times.append(end_comm - start_forward)
@@ -326,6 +402,8 @@ def benchmark_ddp_training(
         'throughput': num_steps / total_times.sum().item() if total_times.sum().item() > 0 else 0
     }
     
+    # Clean up resources
+    ddp_model.cleanup()
     cleanup_process_group()
     return results
 
@@ -366,6 +444,9 @@ def benchmark_single_process(
     model = create_model(config, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     
+    # Initialize GradScaler for mixed precision training
+    scaler = GradScaler()
+    
     # Generate data
     batch = generate_random_batch(batch_size, seq_len, config['vocab_size'], device)
     targets = torch.randint(0, config['vocab_size'], (batch_size, seq_len), device=device)
@@ -377,10 +458,12 @@ def benchmark_single_process(
     print(f"Single process: Running {num_warmup} warm-up steps...")
     for _ in range(num_warmup):
         optimizer.zero_grad()
-        logits = model(batch)
-        loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
-        loss.backward()
-        optimizer.step()
+        with autocast('cuda', dtype=torch.bfloat16):
+            logits = model(batch)
+            loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         torch.cuda.synchronize()
     
     # Benchmarking phase
@@ -395,8 +478,9 @@ def benchmark_single_process(
         start_forward = timeit.default_timer()
         
         optimizer.zero_grad()
-        logits = model(batch)
-        loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+        with autocast('cuda', dtype=torch.bfloat16):
+            logits = model(batch)
+            loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
         
         torch.cuda.synchronize()
         end_forward = timeit.default_timer()
@@ -404,13 +488,14 @@ def benchmark_single_process(
         
         # Backward pass timing
         start_backward = timeit.default_timer()
-        loss.backward()
+        scaler.scale(loss).backward()
         torch.cuda.synchronize()
         end_backward = timeit.default_timer()
         backward_times.append(end_backward - start_backward)
         
         # Optimizer step
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         
         # Total time for this step
         total_times.append(end_backward - start_forward)
@@ -433,6 +518,14 @@ def benchmark_single_process(
         'total_time': total_times.sum().item(),
         'throughput': num_steps / total_times.sum().item() if total_times.sum().item() > 0 else 0
     }
+
+    del model
+    del optimizer
+    del scaler
+    del batch
+    del targets
+    del loss_fn
+    torch.cuda.empty_cache()
     
     return results
 
@@ -504,7 +597,7 @@ def main():
                        help='GPT-2 model size to benchmark')
     
     # Benchmarking parameters
-    parser.add_argument('--batch_size', type=int, default=8, help='Total batch size across all processes')
+    parser.add_argument('--batch_size', type=int, default=2, help='Total batch size across all processes')
     parser.add_argument('--seq_len', type=int, default=512, help='Sequence length')
     parser.add_argument('--num_warmup', type=int, default=5, help='Number of warm-up steps')
     parser.add_argument('--num_steps', type=int, default=20, help='Number of benchmark steps')
@@ -597,62 +690,135 @@ if __name__ == '__main__':
 
 
 # ================================================================================
-# DDP BENCHMARKING RESULTS @ Nvidia RTX 4090*2 (24GB)
+# DDP BENCHMARKING RESULTS @ Nvidia H100*2 (80GB)
 # ================================================================================
-# Model Configuration (gpt2):
+# Model Configuration (gpt2-xl):
 #   - Vocab size: 50,257
 #   - Context length: 512
-#   - d_model: 768
-#   - Num layers: 12
-#   - Num heads: 12
-#   - d_ff: 3,072
+#   - d_model: 1,600
+#   - Num layers: 48
+#   - Num heads: 25
+#   - d_ff: 6,400
 #   - Rope theta: 10000.0
 
 # Training Configuration:
-#   - Total batch size: 8
+#   - Total batch size: 2
 #   - World size: 2
-#   - Local batch size: 4
+#   - Local batch size: 1
+
+
 
 # ================================================================================
 # Baseline: Single Process Training
 # ================================================================================
 
 # Single Process Results:
-#   - Forward pass: 66.530 ± 0.307 ms
-#   - Backward pass: 128.165 ± 0.284 ms
-#   - Total time per step: 194.696 ± 0.500 ms
-#   - Throughput: 5.14 steps/s
+#   - Forward pass: 73.837 ± 0.504 ms
+#   - Backward pass: 138.524 ± 0.762 ms
+#   - Total time per step: 212.361 ± 0.962 ms
+#   - Throughput: 4.71 steps/s
 
 # ================================================================================
 # Naive DDP Implementation
 # ================================================================================
 
+# Single Process Results:
+#   - Forward pass: 73.837 ± 0.504 ms
+#   - Backward pass: 138.524 ± 0.762 ms
+#   - Total time per step: 212.361 ± 0.962 ms
+#   - Throughput: 4.71 steps/s
+
 # DDP Results (2 GPUs):
-#   - Forward pass: 35.646 ± 2.183 ms
-#   - Backward pass: 65.135 ± 0.291 ms
-#   - Communication: 159.884 ± 1.870 ms
-#   - Total time per step: 260.667 ± 2.715 ms
-#   - Throughput: 3.84 steps/s
+#   - Forward pass: 80.084 ± 12.138 ms
+#   - Backward pass: 137.232 ± 1.740 ms
+#   - Communication: 50.501 ± 12.959 ms
+#   - Total time per step: 267.819 ± 23.726 ms
+#   - Throughput: 3.73 steps/s
 
 # Communication Overhead Analysis:
-#   - Communication time: 159.884 ms
-#   - Communication overhead: 61.34%
-#   - Speedup vs single GPU: 0.75x
-#   - Scaling efficiency: 37.35%
+#   - Communication time: 50.501 ms
+#   - Communication overhead: 18.86%
+#   - Speedup vs single GPU: 0.79x
+#   - Scaling efficiency: 39.65%
 
 # ================================================================================
 # Naive DDP Implementation with Reducing the Number of Communication Calls
 # ================================================================================
 
+# Single Process Results:
+#   - Forward pass: 72.675 ± 0.878 ms
+#   - Backward pass: 137.768 ± 1.761 ms
+#   - Total time per step: 210.443 ± 1.992 ms
+#   - Throughput: 4.75 steps/s
+
 # DDP Results (2 GPUs):
-#   - Forward pass: 39.623 ± 5.194 ms
-#   - Backward pass: 65.417 ± 0.721 ms
-#   - Communication: 145.125 ± 3.153 ms
-#   - Total time per step: 250.167 ± 5.297 ms
-#   - Throughput: 4.00 steps/s
+#   - Forward pass: 78.443 ± 11.182 ms
+#   - Backward pass: 137.193 ± 1.382 ms
+#   - Communication: 45.986 ± 11.821 ms
+#   - Total time per step: 261.624 ± 21.713 ms
+#   - Throughput: 3.82 steps/s
 
 # Communication Overhead Analysis:
-#   - Communication time: 145.125 ms
-#   - Communication overhead: 58.01%
-#   - Speedup vs single GPU: 0.78x
-#   - Scaling efficiency: 38.99%
+#   - Communication time: 45.986 ms
+#   - Communication overhead: 17.58%
+#   - Speedup vs single GPU: 0.80x
+#   - Scaling efficiency: 40.22%
+
+# ================================================================================
+# Naive DDP Implementation with Overlap Individual Gradients
+# ================================================================================
+
+# Single Process Results:
+#   - Forward pass: 74.929 ± 0.369 ms
+#   - Backward pass: 137.619 ± 2.413 ms
+#   - Total time per step: 212.549 ± 2.445 ms
+#   - Throughput: 4.70 steps/s
+
+# DDP Results (2 GPUs):
+#   - Forward pass: 100.091 ± 7.552 ms
+#   - Backward pass: 211.093 ± 8.129 ms
+#   - Communication: 1.889 ± 0.375 ms
+#   - Total time per step: 313.074 ± 13.992 ms
+#   - Throughput: 3.19 steps/s
+
+# Communication Overhead Analysis:
+#   - Communication time: 1.889 ms
+#   - Communication overhead: 0.60%
+#   - Speedup vs single GPU: 0.68x
+#   - Scaling efficiency: 33.95%
+
+# ================================================================================
+# Naive DDP Implementation with Overlap Bucketed Gradients
+# ================================================================================
+
+# Bucket Size: 1 MB
+# DDP Results (2 GPUs):
+#   - Forward pass: 73.228 ± 1.380 ms
+#   - Backward pass: 176.737 ± 2.706 ms
+#   - Communication: 7.938 ± 0.385 ms
+#   - Total time per step: 257.904 ± 3.115 ms
+#   - Throughput: 3.88 steps/s
+
+# Bucket Size: 10 MB
+# DDP Results (2 GPUs):
+#   - Forward pass: 102.143 ± 2.862 ms
+#   - Backward pass: 201.137 ± 17.154 ms
+#   - Communication: 10.241 ± 0.643 ms
+#   - Total time per step: 313.523 ± 16.219 ms
+#   - Throughput: 3.19 steps/s
+
+# Bucket Size: 100 MB
+# DDP Results (2 GPUs):
+#   - Forward pass: 77.502 ± 2.113 ms
+#   - Backward pass: 171.163 ± 3.320 ms
+#   - Communication: 7.807 ± 0.331 ms
+#   - Total time per step: 256.473 ± 3.768 ms
+#   - Throughput: 3.90 steps/s
+
+# Bucket Size: 1000 MB
+# DDP Results (2 GPUs):
+#   - Forward pass: 74.058 ± 1.608 ms
+#   - Backward pass: 148.813 ± 11.000 ms
+#   - Communication: 7.676 ± 0.126 ms
+#   - Total time per step: 230.549 ± 11.275 ms
+#   - Throughput: 4.34 steps/s
